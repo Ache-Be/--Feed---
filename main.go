@@ -20,8 +20,13 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", handlers.UI)
 	mux.HandleFunc("/publish", handlers.Publish)
 	mux.HandleFunc("/feed", handlers.Feed)
+	mux.HandleFunc("/follow", handlers.Follow)
+	mux.HandleFunc("/unfollow", handlers.Unfollow)
+	mux.HandleFunc("/following", handlers.Following)
+	mux.HandleFunc("/home_feed", handlers.HomeFeed)
 
 	// 额外提供一个简单的健康检查接口（可选但不影响核心要求）
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

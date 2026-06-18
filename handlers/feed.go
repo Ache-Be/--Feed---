@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -10,6 +12,20 @@ import (
 
 	"videofeed/redis_client"
 )
+
+type followRequest struct {
+	UserID       string `json:"user_id"`
+	TargetUserID string `json:"target_user_id"`
+}
+
+type homeFeedEntry struct {
+	AuthorID    string `json:"author_id"`
+	VideoID     string `json:"video_id"`
+	PublishTime int64  `json:"publish_time"`
+}
+
+func followingKey(userID string) string { return "relation:following:" + userID }
+func followersKey(userID string) string { return "relation:followers:" + userID }
 
 // Feed 处理 GET /feed?user_id=123&limit=20&cursor_score=1710000000000&cursor_video_id=vid_001
 //
@@ -65,9 +81,9 @@ func Feed(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		hasCursor      bool
-		cursorScore    int64
-		cursorVideoID  string
+		hasCursor     bool
+		cursorScore   int64
+		cursorVideoID string
 	)
 	if scoreStr := r.URL.Query().Get("cursor_score"); scoreStr != "" {
 		v, err := strconv.ParseInt(scoreStr, 10, 64)
@@ -182,4 +198,263 @@ func Feed(w http.ResponseWriter, r *http.Request) {
 
 	// 注意：我们只存 video_id（member），不存视频详情。MVP 只需要能返回视频ID列表即可。
 	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Data: videoIDs, NextCursor: nextCursor})
+}
+
+func Follow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Code: 1, Msg: "method not allowed"})
+		return
+	}
+
+	var req followRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Code: 1, Msg: "invalid json"})
+		return
+	}
+	req.UserID = strings.TrimSpace(req.UserID)
+	req.TargetUserID = strings.TrimSpace(req.TargetUserID)
+	if req.UserID == "" || req.TargetUserID == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Code: 1, Msg: "missing user_id or target_user_id"})
+		return
+	}
+	if req.UserID == req.TargetUserID {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Code: 1, Msg: "cannot follow self"})
+		return
+	}
+
+	c := redis_client.Get()
+	if c == nil {
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "redis client not initialized"})
+		return
+	}
+
+	_, err := c.TxPipelined(r.Context(), func(p redis.Pipeliner) error {
+		p.SAdd(r.Context(), followingKey(req.UserID), req.TargetUserID)
+		p.SAdd(r.Context(), followersKey(req.TargetUserID), req.UserID)
+		return nil
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "redis sadd failed"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Msg: "success"})
+}
+
+func Unfollow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Code: 1, Msg: "method not allowed"})
+		return
+	}
+
+	var req followRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Code: 1, Msg: "invalid json"})
+		return
+	}
+	req.UserID = strings.TrimSpace(req.UserID)
+	req.TargetUserID = strings.TrimSpace(req.TargetUserID)
+	if req.UserID == "" || req.TargetUserID == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Code: 1, Msg: "missing user_id or target_user_id"})
+		return
+	}
+	if req.UserID == req.TargetUserID {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Code: 1, Msg: "cannot unfollow self"})
+		return
+	}
+
+	c := redis_client.Get()
+	if c == nil {
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "redis client not initialized"})
+		return
+	}
+
+	_, err := c.TxPipelined(r.Context(), func(p redis.Pipeliner) error {
+		p.SRem(r.Context(), followingKey(req.UserID), req.TargetUserID)
+		p.SRem(r.Context(), followersKey(req.TargetUserID), req.UserID)
+		return nil
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "redis srem failed"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Msg: "success"})
+}
+
+func Following(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Code: 1, Msg: "method not allowed"})
+		return
+	}
+
+	userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
+	if userID == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Code: 1, Msg: "missing user_id"})
+		return
+	}
+
+	c := redis_client.Get()
+	if c == nil {
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "redis client not initialized"})
+		return
+	}
+
+	users, err := c.SMembers(r.Context(), followingKey(userID)).Result()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "redis smembers failed"})
+		return
+	}
+	sort.Strings(users)
+	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Data: users})
+}
+
+func HomeFeed(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Code: 1, Msg: "method not allowed"})
+		return
+	}
+
+	userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
+	if userID == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Code: 1, Msg: "missing user_id"})
+		return
+	}
+
+	limit := int64(20)
+	if s := r.URL.Query().Get("limit"); s != "" {
+		v, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || v <= 0 {
+			writeJSON(w, http.StatusBadRequest, apiResponse{Code: 1, Msg: "invalid limit"})
+			return
+		}
+		if v > 100 {
+			v = 100
+		}
+		limit = v
+	}
+
+	var (
+		hasCursor     bool
+		cursorScore   int64
+		cursorVideoID string
+	)
+	if scoreStr := r.URL.Query().Get("cursor_score"); scoreStr != "" {
+		v, err := strconv.ParseInt(scoreStr, 10, 64)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiResponse{Code: 1, Msg: "invalid cursor_score"})
+			return
+		}
+		cursorScore = v
+		hasCursor = true
+	}
+	if hasCursor {
+		cursorVideoID = strings.TrimSpace(r.URL.Query().Get("cursor_video_id"))
+		if cursorVideoID == "" {
+			writeJSON(w, http.StatusBadRequest, apiResponse{Code: 1, Msg: "missing cursor_video_id"})
+			return
+		}
+	}
+
+	c := redis_client.Get()
+	if c == nil {
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "redis client not initialized"})
+		return
+	}
+
+	following, err := c.SMembers(r.Context(), followingKey(userID)).Result()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "redis smembers failed"})
+		return
+	}
+	if len(following) == 0 {
+		writeJSON(w, http.StatusOK, apiResponse{Code: 0, Data: []homeFeedEntry{}})
+		return
+	}
+
+	sort.Strings(following)
+	if len(following) > 200 {
+		following = following[:200]
+	}
+
+	perAuthor := int64(50)
+	if perAuthor < limit*3 {
+		perAuthor = limit * 3
+	}
+	if perAuthor > 200 {
+		perAuthor = 200
+	}
+
+	type candidate struct {
+		authorID string
+		videoID  string
+		score    int64
+	}
+	cands := make([]candidate, 0, int(limit)+1)
+
+	max := "+inf"
+	if hasCursor {
+		max = strconv.FormatInt(cursorScore, 10)
+	}
+
+	for _, authorID := range following {
+		key := "feed:timeline:" + authorID
+		res, e := c.ZRevRangeByScoreWithScores(r.Context(), key, &redis.ZRangeBy{
+			Max:    max,
+			Min:    "-inf",
+			Offset: 0,
+			Count:  perAuthor,
+		}).Result()
+		if e != nil {
+			writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "redis zrevrangebyscore failed"})
+			return
+		}
+		for _, z := range res {
+			score := int64(z.Score)
+			videoID := fmt.Sprint(z.Member)
+
+			if hasCursor {
+				if score > cursorScore {
+					continue
+				}
+				if score == cursorScore && videoID >= cursorVideoID {
+					continue
+				}
+			}
+
+			cands = append(cands, candidate{authorID: authorID, videoID: videoID, score: score})
+		}
+	}
+
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].score != cands[j].score {
+			return cands[i].score > cands[j].score
+		}
+		if cands[i].videoID != cands[j].videoID {
+			return cands[i].videoID > cands[j].videoID
+		}
+		return cands[i].authorID > cands[j].authorID
+	})
+
+	hasMore := int64(len(cands)) > limit
+	if hasMore {
+		cands = cands[:limit]
+	}
+
+	out := make([]homeFeedEntry, 0, len(cands))
+	for _, it := range cands {
+		out = append(out, homeFeedEntry{
+			AuthorID:    it.authorID,
+			VideoID:     it.videoID,
+			PublishTime: it.score,
+		})
+	}
+
+	var nextCursor *cursorToken
+	if hasMore && len(cands) > 0 {
+		last := cands[len(cands)-1]
+		nextCursor = &cursorToken{Score: last.score, VideoID: last.videoID}
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Data: out, NextCursor: nextCursor})
 }
