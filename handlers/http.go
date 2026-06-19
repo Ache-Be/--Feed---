@@ -92,8 +92,10 @@ const uiHTML = `<!doctype html>
     <h3>拉取</h3>
     <div class="row">
       <button id="btnMyFeed">我的时间线（/feed）</button>
+      <button id="btnMyFeedPrev" class="secondary" disabled>上一页（我的时间线）</button>
       <button id="btnMyFeedNext" class="secondary" disabled>下一页（我的时间线）</button>
       <button id="btnHomeFeed">关注页（/home_feed）</button>
+      <button id="btnHomeFeedPrev" class="secondary" disabled>上一页（关注页）</button>
       <button id="btnHomeFeedNext" class="secondary" disabled>下一页（关注页）</button>
     </div>
   </div>
@@ -109,15 +111,53 @@ const uiHTML = `<!doctype html>
     const targetUserIdEl = document.getElementById("targetUserId");
     const videoIdEl = document.getElementById("videoId");
 
-    let myCursor = null;
-    let homeCursor = null;
+    let myPageCursor = null;
+    let myNextCursor = null;
+    let myHistory = [];
+
+    let homePageCursor = null;
+    let homeNextCursor = null;
+    let homeHistory = [];
 
     function userId() { return (userIdEl.value || "").trim(); }
     function targetUserId() { return (targetUserIdEl.value || "").trim(); }
     function videoId() { return (videoIdEl.value || "").trim(); }
 
+    function formatTimestamp(ms) {
+      if (typeof ms !== "number") return ms;
+      const d = new Date(ms);
+      if (Number.isNaN(d.getTime())) return ms;
+      const pad = (n) => String(n).padStart(2, "0");
+      return d.getFullYear() + "-" +
+        pad(d.getMonth() + 1) + "-" +
+        pad(d.getDate()) + " " +
+        pad(d.getHours()) + ":" +
+        pad(d.getMinutes()) + ":" +
+        pad(d.getSeconds());
+    }
+
+    function decorate(obj) {
+      if (Array.isArray(obj)) {
+        return obj.map(decorate);
+      }
+      if (obj && typeof obj === "object") {
+        const copy = {};
+        for (const [k, v] of Object.entries(obj)) {
+          copy[k] = decorate(v);
+          if (k === "publish_time" && typeof v === "number") {
+            copy.publish_time_text = formatTimestamp(v);
+          }
+          if (k === "score" && typeof v === "number") {
+            copy.score_text = formatTimestamp(v);
+          }
+        }
+        return copy;
+      }
+      return obj;
+    }
+
     function setOutput(obj) {
-      out.textContent = JSON.stringify(obj, null, 2);
+      out.textContent = JSON.stringify(decorate(obj), null, 2);
     }
 
     async function getJSON(url) {
@@ -137,8 +177,10 @@ const uiHTML = `<!doctype html>
     }
 
     function updateButtons() {
-      document.getElementById("btnMyFeedNext").disabled = !myCursor;
-      document.getElementById("btnHomeFeedNext").disabled = !homeCursor;
+      document.getElementById("btnMyFeedPrev").disabled = myHistory.length === 0;
+      document.getElementById("btnMyFeedNext").disabled = !myNextCursor;
+      document.getElementById("btnHomeFeedPrev").disabled = homeHistory.length === 0;
+      document.getElementById("btnHomeFeedNext").disabled = !homeNextCursor;
     }
 
     async function publish() {
@@ -168,28 +210,70 @@ const uiHTML = `<!doctype html>
       setOutput(data);
     }
 
-    async function myFeed(reset) {
+    async function myFeed(pageCursor) {
       const u = userId();
       let url = "/feed?user_id=" + encodeURIComponent(u) + "&limit=20";
-      if (!reset && myCursor) {
-        url += "&cursor_score=" + encodeURIComponent(myCursor.score) + "&cursor_video_id=" + encodeURIComponent(myCursor.video_id);
+      if (pageCursor) {
+        url += "&cursor_score=" + encodeURIComponent(pageCursor.score) + "&cursor_video_id=" + encodeURIComponent(pageCursor.video_id);
       }
       const data = await getJSON(url);
-      myCursor = data.next_cursor || null;
+      myPageCursor = pageCursor;
+      myNextCursor = data.next_cursor || null;
       updateButtons();
       setOutput(data);
     }
 
-    async function homeFeed(reset) {
+    async function homeFeed(pageCursor) {
       const u = userId();
       let url = "/home_feed?user_id=" + encodeURIComponent(u) + "&limit=20";
-      if (!reset && homeCursor) {
-        url += "&cursor_score=" + encodeURIComponent(homeCursor.score) + "&cursor_video_id=" + encodeURIComponent(homeCursor.video_id);
+      if (pageCursor) {
+        url += "&cursor_score=" + encodeURIComponent(pageCursor.score) + "&cursor_video_id=" + encodeURIComponent(pageCursor.video_id);
       }
       const data = await getJSON(url);
-      homeCursor = data.next_cursor || null;
+      homePageCursor = pageCursor;
+      homeNextCursor = data.next_cursor || null;
       updateButtons();
       setOutput(data);
+    }
+
+    async function myFeedFirst() {
+      myHistory = [];
+      myPageCursor = null;
+      myNextCursor = null;
+      updateButtons();
+      await myFeed(null);
+    }
+
+    async function myFeedNext() {
+      if (!myNextCursor) return;
+      myHistory.push(myPageCursor);
+      await myFeed(myNextCursor);
+    }
+
+    async function myFeedPrev() {
+      if (myHistory.length === 0) return;
+      const prevCursor = myHistory.pop();
+      await myFeed(prevCursor);
+    }
+
+    async function homeFeedFirst() {
+      homeHistory = [];
+      homePageCursor = null;
+      homeNextCursor = null;
+      updateButtons();
+      await homeFeed(null);
+    }
+
+    async function homeFeedNext() {
+      if (!homeNextCursor) return;
+      homeHistory.push(homePageCursor);
+      await homeFeed(homeNextCursor);
+    }
+
+    async function homeFeedPrev() {
+      if (homeHistory.length === 0) return;
+      const prevCursor = homeHistory.pop();
+      await homeFeed(prevCursor);
     }
 
     document.getElementById("btnPublish").addEventListener("click", () => publish());
@@ -197,10 +281,12 @@ const uiHTML = `<!doctype html>
     document.getElementById("btnUnfollow").addEventListener("click", () => unfollow());
     document.getElementById("btnFollowing").addEventListener("click", () => following());
 
-    document.getElementById("btnMyFeed").addEventListener("click", () => { myCursor = null; updateButtons(); myFeed(true); });
-    document.getElementById("btnMyFeedNext").addEventListener("click", () => myFeed(false));
-    document.getElementById("btnHomeFeed").addEventListener("click", () => { homeCursor = null; updateButtons(); homeFeed(true); });
-    document.getElementById("btnHomeFeedNext").addEventListener("click", () => homeFeed(false));
+    document.getElementById("btnMyFeed").addEventListener("click", () => myFeedFirst());
+    document.getElementById("btnMyFeedPrev").addEventListener("click", () => myFeedPrev());
+    document.getElementById("btnMyFeedNext").addEventListener("click", () => myFeedNext());
+    document.getElementById("btnHomeFeed").addEventListener("click", () => homeFeedFirst());
+    document.getElementById("btnHomeFeedPrev").addEventListener("click", () => homeFeedPrev());
+    document.getElementById("btnHomeFeedNext").addEventListener("click", () => homeFeedNext());
 
     updateButtons();
     setOutput({ code: 0, msg: "ready" });

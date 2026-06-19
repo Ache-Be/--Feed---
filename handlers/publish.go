@@ -2,11 +2,15 @@ package handlers
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
+	"videofeed/mq_client"
+	"videofeed/mysql_client"
 	"videofeed/redis_client"
 )
 
@@ -36,16 +40,19 @@ func Publish(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, apiResponse{Code: 1, Msg: "invalid json"})
 		return
 	}
+	req.UserID = strings.TrimSpace(req.UserID)
+	req.VideoID = strings.TrimSpace(req.VideoID)
 	if req.UserID == "" || req.VideoID == "" {
 		writeJSON(w, http.StatusBadRequest, apiResponse{Code: 1, Msg: "missing user_id or video_id"})
 		return
 	}
 
-	c := redis_client.Get()
-	if c == nil {
-		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "redis client not initialized"})
+	db := mysql_client.Get()
+	if db == nil {
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "mysql client not initialized"})
 		return
 	}
+	c := redis_client.Get()
 
 	key := "feed:timeline:" + req.UserID
 	score := time.Now().UnixMilli()
@@ -56,14 +63,38 @@ func Publish(w http.ResponseWriter, r *http.Request) {
 	// - score: 发布时刻（毫秒）
 	//
 	// 这样后续就可以用 ZREVRANGE 按 score 倒序取出“最新发布”的视频ID列表。
-	if err := c.ZAdd(r.Context(), key, redis.Z{
-		Score:  float64(score),
-		Member: req.VideoID,
-	}).Err(); err != nil {
-		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "redis zadd failed"})
+	if _, err := db.ExecContext(r.Context(),
+		`INSERT INTO videos (author_id, video_id, publish_time) VALUES (?, ?, ?)
+		 ON DUPLICATE KEY UPDATE publish_time = VALUES(publish_time)`,
+		req.UserID, req.VideoID, score,
+	); err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "mysql insert video failed"})
 		return
+	}
+
+	if c != nil {
+		if err := c.ZAdd(r.Context(), key, redis.Z{
+			Score:  float64(score),
+			Member: req.VideoID,
+		}).Err(); err != nil {
+			log.Printf("publish timeline cache update failed: %v", err)
+			_ = c.Del(r.Context(), key).Err()
+		}
+	}
+
+	if c != nil {
+		event := mq_client.FeedEvent{
+			AuthorID: req.UserID,
+			VideoID:  req.VideoID,
+			Score:    score,
+		}
+		if err := mq_client.PublishFeedEvent(r.Context(), event); err != nil {
+			if err := FanoutToFollowers(r.Context(), req.UserID, req.VideoID, score); err != nil {
+				writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "fanout failed"})
+				return
+			}
+		}
 	}
 
 	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Msg: "success"})
 }
-

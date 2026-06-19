@@ -48,3 +48,10 @@ func Get() *redis.Client {
 	return client
 }
 
+func Close() {
+	if client == nil {
+		return
+	}
+	_ = client.Close()
+	client = nil
+}

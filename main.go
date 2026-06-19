@@ -2,23 +2,56 @@ package main
 
 import (
 	"context"
+	"flag"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 
 	"videofeed/handlers"
+	"videofeed/mq_client"
+	"videofeed/mysql_client"
 	"videofeed/redis_client"
 )
 
 func main() {
-	// 初始化 Redis 连接：服务启动时就验证 Redis 是否可用（Ping）。
-	// 如果 Redis 连接失败，直接退出，避免服务“假启动”。
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	mode := envOrDefault("APP_MODE", "api")
+	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	fs.StringVar(&mode, "mode", mode, "")
+	_ = fs.Parse(os.Args[1:])
+
+	ctx, cancel := context.WithTimeout(rootCtx, 5*time.Second)
 	defer cancel()
+	if _, err := mysql_client.Init(ctx); err != nil {
+		log.Fatalf("init mysql failed: %v", err)
+	}
+	defer mysql_client.Close()
+
 	if _, err := redis_client.Init(ctx); err != nil {
-		log.Fatalf("init redis failed: %v", err)
+		log.Printf("redis disabled, fallback to mysql query path: %v", err)
+	}
+	defer redis_client.Close()
+	if _, err := mq_client.Init(ctx); err != nil {
+		log.Printf("rabbitmq disabled, fallback to sync fanout: %v", err)
+	}
+	defer mq_client.Close()
+
+	if strings.EqualFold(mode, "worker") {
+		runWorker(rootCtx)
+		return
 	}
 
+	runAPI(rootCtx)
+}
+
+func runAPI(ctx context.Context) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handlers.UI)
 	mux.HandleFunc("/publish", handlers.Publish)
@@ -47,7 +80,79 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("server stopped: %v", err)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.ListenAndServe()
+	}()
+
+	select {
+	case <-ctx.Done():
+		log.Printf("api shutting down")
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("api shutdown failed: %v", err)
+		}
+	case err := <-errCh:
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server stopped: %v", err)
+		}
 	}
+}
+
+func runWorker(ctx context.Context) {
+	if !mq_client.Enabled() {
+		log.Printf("worker idle: rabbitmq not initialized, api will use sync fanout")
+		<-ctx.Done()
+		log.Printf("worker stopped")
+		return
+	}
+	if redis_client.Get() == nil {
+		log.Printf("worker idle: redis not initialized, api will use mysql query path")
+		<-ctx.Done()
+		log.Printf("worker stopped")
+		return
+	}
+
+	consumer := fmt.Sprintf("worker-%d", os.Getpid())
+	log.Printf("worker started, consumer=%s", consumer)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("worker shutting down")
+			return
+		default:
+		}
+
+		err := mq_client.ConsumeFeedEvents(ctx, func(event mq_client.FeedEvent) error {
+			return handlers.FanoutToFollowers(ctx, event.AuthorID, event.VideoID, event.Score)
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				log.Printf("worker stopped")
+				return
+			}
+			log.Printf("consume mq failed: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			log.Printf("worker stopped")
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func envOrDefault(key, def string) string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	return v
 }
