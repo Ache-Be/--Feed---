@@ -23,15 +23,29 @@ type followRequest struct {
 	TargetUserID string `json:"target_user_id"`
 }
 
-type homeFeedEntry struct {
-	AuthorID    string `json:"author_id"`
-	VideoID     string `json:"video_id"`
-	PublishTime int64  `json:"publish_time"`
-}
-
 type timelineItem struct {
 	videoID string
 	score   int64
+}
+
+type videoDetail struct {
+	AuthorID       string `json:"author_id"`
+	AuthorNickname string `json:"author_nickname,omitempty"`
+	AuthorAvatar   string `json:"author_avatar,omitempty"`
+	VideoID        string `json:"video_id"`
+	Title          string `json:"title"`
+	CoverURL       string `json:"cover_url"`
+	VideoURL       string `json:"video_url"`
+	Description    string `json:"description,omitempty"`
+	PublishTime    int64  `json:"publish_time"`
+	LikeCount      int64  `json:"like_count"`
+	Liked          bool   `json:"liked"`
+}
+
+type videoRef struct {
+	authorID string
+	videoID  string
+	score    int64
 }
 
 func followingKey(userID string) string { return "relation:following:" + userID }
@@ -357,9 +371,24 @@ func Feed(w http.ResponseWriter, r *http.Request) {
 		collected = collected[:limit]
 	}
 
-	videoIDs := make([]string, 0, len(collected))
+	videoRefs := make([]videoRef, 0, len(collected))
 	for _, it := range collected {
-		videoIDs = append(videoIDs, it.videoID)
+		videoRefs = append(videoRefs, videoRef{
+			authorID: userID,
+			videoID:  it.videoID,
+			score:    it.score,
+		})
+	}
+
+	videos, err := loadVideoDetails(r.Context(), videoRefs)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "mysql load video details failed"})
+		return
+	}
+	currentUser, _ := currentUsername(r)
+	if err := attachLikeStatsToVideos(r.Context(), currentUser, videos); err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "load video likes failed"})
+		return
 	}
 
 	var nextCursor *cursorToken
@@ -368,8 +397,7 @@ func Feed(w http.ResponseWriter, r *http.Request) {
 		nextCursor = &cursorToken{Score: last.score, VideoID: last.videoID}
 	}
 
-	// 注意：我们只存 video_id（member），不存视频详情。MVP 只需要能返回视频ID列表即可。
-	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Data: videoIDs, NextCursor: nextCursor})
+	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Data: videos, NextCursor: nextCursor})
 }
 
 func HomeFeed(w http.ResponseWriter, r *http.Request) {
@@ -519,7 +547,7 @@ func HomeFeed(w http.ResponseWriter, r *http.Request) {
 		collected = collected[:limit]
 	}
 
-	out := make([]homeFeedEntry, 0, len(collected))
+	videoRefs := make([]videoRef, 0, len(collected))
 	for _, it := range collected {
 		parts := strings.SplitN(it.member, "|", 2)
 		authorID := ""
@@ -528,11 +556,22 @@ func HomeFeed(w http.ResponseWriter, r *http.Request) {
 			authorID = parts[0]
 			videoID = parts[1]
 		}
-		out = append(out, homeFeedEntry{
-			AuthorID:    authorID,
-			VideoID:     videoID,
-			PublishTime: it.score,
+		videoRefs = append(videoRefs, videoRef{
+			authorID: authorID,
+			videoID:  videoID,
+			score:    it.score,
 		})
+	}
+
+	videos, err := loadVideoDetails(r.Context(), videoRefs)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "mysql load video details failed"})
+		return
+	}
+	currentUser, _ := currentUsername(r)
+	if err := attachLikeStatsToVideos(r.Context(), currentUser, videos); err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "load video likes failed"})
+		return
 	}
 
 	var nextCursor *cursorToken
@@ -541,7 +580,7 @@ func HomeFeed(w http.ResponseWriter, r *http.Request) {
 		nextCursor = &cursorToken{Score: last.score, VideoID: last.member}
 	}
 
-	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Data: out, NextCursor: nextCursor})
+	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Data: videos, NextCursor: nextCursor})
 }
 
 func FanoutToFollowers(ctx context.Context, authorID, videoID string, score int64) error {
@@ -793,7 +832,7 @@ func queryAuthorVideos(ctx context.Context, authorID string, hasCursor bool, cur
 	return items, nil
 }
 
-func queryHomeFeed(ctx context.Context, userID string, hasCursor bool, cursorScore int64, cursorVideoID string, limit int64) ([]homeFeedEntry, error) {
+func queryHomeFeed(ctx context.Context, userID string, hasCursor bool, cursorScore int64, cursorVideoID string, limit int64) ([]videoDetail, error) {
 	db := mysql_client.Get()
 	if db == nil {
 		return nil, nil
@@ -813,9 +852,10 @@ func queryHomeFeed(ctx context.Context, userID string, hasCursor bool, cursorSco
 		cursorVideo := parts[1]
 
 		rows, err = db.QueryContext(ctx,
-			`SELECT v.author_id, v.video_id, v.publish_time
+			`SELECT v.author_id, COALESCE(u.nickname, v.author_id), COALESCE(u.avatar_url, ''), v.video_id, v.title, v.cover_url, v.video_url, v.description, v.publish_time
 			 FROM follows f
 			 JOIN videos v ON v.author_id = f.target_user_id
+			 LEFT JOIN users u ON u.username = v.author_id
 			 WHERE f.user_id = ?
 			   AND (v.publish_time < ?
 			     OR (v.publish_time = ? AND (v.author_id < ? OR (v.author_id = ? AND v.video_id < ?))))
@@ -825,9 +865,10 @@ func queryHomeFeed(ctx context.Context, userID string, hasCursor bool, cursorSco
 		)
 	} else {
 		rows, err = db.QueryContext(ctx,
-			`SELECT v.author_id, v.video_id, v.publish_time
+			`SELECT v.author_id, COALESCE(u.nickname, v.author_id), COALESCE(u.avatar_url, ''), v.video_id, v.title, v.cover_url, v.video_url, v.description, v.publish_time
 			 FROM follows f
 			 JOIN videos v ON v.author_id = f.target_user_id
+			 LEFT JOIN users u ON u.username = v.author_id
 			 WHERE f.user_id = ?
 			 ORDER BY v.publish_time DESC, v.author_id DESC, v.video_id DESC
 			 LIMIT ?`,
@@ -839,10 +880,10 @@ func queryHomeFeed(ctx context.Context, userID string, hasCursor bool, cursorSco
 	}
 	defer rows.Close()
 
-	items := make([]homeFeedEntry, 0, limit)
+	items := make([]videoDetail, 0, limit)
 	for rows.Next() {
-		var it homeFeedEntry
-		if err := rows.Scan(&it.AuthorID, &it.VideoID, &it.PublishTime); err != nil {
+		var it videoDetail
+		if err := rows.Scan(&it.AuthorID, &it.AuthorNickname, &it.AuthorAvatar, &it.VideoID, &it.Title, &it.CoverURL, &it.VideoURL, &it.Description, &it.PublishTime); err != nil {
 			return nil, err
 		}
 		items = append(items, it)
@@ -852,4 +893,73 @@ func queryHomeFeed(ctx context.Context, userID string, hasCursor bool, cursorSco
 	}
 
 	return items, nil
+}
+
+func loadVideoDetails(ctx context.Context, refs []videoRef) ([]videoDetail, error) {
+	if len(refs) == 0 {
+		return []videoDetail{}, nil
+	}
+
+	db := mysql_client.Get()
+	if db == nil {
+		return nil, fmt.Errorf("mysql client not initialized")
+	}
+
+	clauses := make([]string, 0, len(refs))
+	args := make([]interface{}, 0, len(refs)*2)
+	for _, ref := range refs {
+		clauses = append(clauses, "(author_id = ? AND video_id = ?)")
+		args = append(args, ref.authorID, ref.videoID)
+	}
+
+	query := `SELECT v.author_id, COALESCE(u.nickname, v.author_id), COALESCE(u.avatar_url, ''), v.video_id, v.title, v.cover_url, v.video_url, v.description, v.publish_time
+		FROM videos v
+		LEFT JOIN users u ON u.username = v.author_id
+		WHERE ` + strings.Join(clauses, " OR ")
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	loaded := make(map[string]videoDetail, len(refs))
+	for rows.Next() {
+		var item videoDetail
+		if err := rows.Scan(
+			&item.AuthorID,
+			&item.AuthorNickname,
+			&item.AuthorAvatar,
+			&item.VideoID,
+			&item.Title,
+			&item.CoverURL,
+			&item.VideoURL,
+			&item.Description,
+			&item.PublishTime,
+		); err != nil {
+			return nil, err
+		}
+		loaded[inboxMember(item.AuthorID, item.VideoID)] = item
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	result := make([]videoDetail, 0, len(refs))
+	for _, ref := range refs {
+		key := inboxMember(ref.authorID, ref.videoID)
+		if item, ok := loaded[key]; ok {
+			if item.PublishTime == 0 {
+				item.PublishTime = ref.score
+			}
+			result = append(result, item)
+			continue
+		}
+
+		result = append(result, videoDetail{
+			AuthorID:    ref.authorID,
+			VideoID:     ref.videoID,
+			PublishTime: ref.score,
+		})
+	}
+	return result, nil
 }

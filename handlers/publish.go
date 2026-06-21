@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -15,8 +16,12 @@ import (
 )
 
 type publishRequest struct {
-	UserID  string `json:"user_id"`
-	VideoID string `json:"video_id"`
+	UserID      string `json:"user_id"`
+	VideoID     string `json:"video_id"`
+	Title       string `json:"title"`
+	CoverURL    string `json:"cover_url"`
+	VideoURL    string `json:"video_url"`
+	Description string `json:"description"`
 }
 
 // Publish 处理 POST /publish
@@ -40,13 +45,19 @@ func Publish(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, apiResponse{Code: 1, Msg: "invalid json"})
 		return
 	}
-	req.UserID = strings.TrimSpace(req.UserID)
-	req.VideoID = strings.TrimSpace(req.VideoID)
-	if req.UserID == "" || req.VideoID == "" {
-		writeJSON(w, http.StatusBadRequest, apiResponse{Code: 1, Msg: "missing user_id or video_id"})
+
+	currentUser, err := requireCurrentUsername(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Code: 1, Msg: "login required"})
 		return
 	}
 
+	req.UserID = currentUser
+	req.VideoID = strings.TrimSpace(req.VideoID)
+	req.Title = strings.TrimSpace(req.Title)
+	req.CoverURL = strings.TrimSpace(req.CoverURL)
+	req.VideoURL = strings.TrimSpace(req.VideoURL)
+	req.Description = strings.TrimSpace(req.Description)
 	db := mysql_client.Get()
 	if db == nil {
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "mysql client not initialized"})
@@ -56,6 +67,9 @@ func Publish(w http.ResponseWriter, r *http.Request) {
 
 	key := "feed:timeline:" + req.UserID
 	score := time.Now().UnixMilli()
+	if req.VideoID == "" {
+		req.VideoID = fmt.Sprintf("vid_%d", score)
+	}
 
 	// Redis ZADD：向 ZSet 中写入一个元素（member=视频ID），并为其指定排序用的 score（发布时间戳）。
 	// - key: feed:timeline:{user_id}
@@ -64,9 +78,15 @@ func Publish(w http.ResponseWriter, r *http.Request) {
 	//
 	// 这样后续就可以用 ZREVRANGE 按 score 倒序取出“最新发布”的视频ID列表。
 	if _, err := db.ExecContext(r.Context(),
-		`INSERT INTO videos (author_id, video_id, publish_time) VALUES (?, ?, ?)
-		 ON DUPLICATE KEY UPDATE publish_time = VALUES(publish_time)`,
-		req.UserID, req.VideoID, score,
+		`INSERT INTO videos (author_id, video_id, title, cover_url, video_url, description, publish_time)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON DUPLICATE KEY UPDATE
+		 	title = VALUES(title),
+		 	cover_url = VALUES(cover_url),
+		 	video_url = VALUES(video_url),
+		 	description = VALUES(description),
+		 	publish_time = VALUES(publish_time)`,
+		req.UserID, req.VideoID, req.Title, req.CoverURL, req.VideoURL, req.Description, score,
 	); err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "mysql insert video failed"})
 		return
@@ -96,5 +116,24 @@ func Publish(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Msg: "success"})
+	profile, _, err := loadAccountProfileWithPassword(r.Context(), db, req.UserID)
+	if err != nil {
+		profile = accountProfile{Username: req.UserID, Nickname: req.UserID}
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code: 0,
+		Msg:  "success",
+		Data: videoDetail{
+			AuthorID:       req.UserID,
+			AuthorNickname: profile.Nickname,
+			AuthorAvatar:   profile.AvatarURL,
+			VideoID:        req.VideoID,
+			Title:          req.Title,
+			CoverURL:       req.CoverURL,
+			VideoURL:       req.VideoURL,
+			Description:    req.Description,
+			PublishTime:    score,
+		},
+	})
 }
