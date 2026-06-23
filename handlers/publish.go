@@ -100,6 +100,9 @@ func Publish(w http.ResponseWriter, r *http.Request) {
 			log.Printf("publish timeline cache update failed: %v", err)
 			_ = c.Del(r.Context(), key).Err()
 		}
+
+		// 新发布的视频初始化热榜分数为 0，后续互动会逐步拉升
+		updateVideoHotScore(r.Context(), req.UserID, req.VideoID)
 	}
 
 	if c != nil {
@@ -109,9 +112,16 @@ func Publish(w http.ResponseWriter, r *http.Request) {
 			Score:    score,
 		}
 		if err := mq_client.PublishFeedEvent(r.Context(), event); err != nil {
+			// MQ 不可用时，降级为同步扇出：
+			// - 直接在 HTTP 请求内遍历粉丝、写入 inbox ZSet
+			// - 延迟会变高（请求内等待），但保证粉丝能及时看到新视频
+			// - 面试话术：「MQ 挂了就走同步降级，保证可用性，延迟换一致性」
+			log.Printf("publish mq failed, fallback to sync fanout: %v", err)
 			if err := FanoutToFollowers(r.Context(), req.UserID, req.VideoID, score); err != nil {
-				writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "fanout failed"})
-				return
+				// 视频已入库，扇出失败不阻塞发布成功返回
+				// 面试话术：「视频已落库，扇出是异步优化路径，失败时兜底策略是允许粉丝
+				//           下一刷时走 MySQL 直查路径，不丢数据，只影响实时性」
+				log.Printf("publish sync fanout failed: %v", err)
 			}
 		}
 	}

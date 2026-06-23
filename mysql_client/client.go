@@ -122,6 +122,26 @@ func ensureSchema(ctx context.Context, c *sql.DB) error {
 			KEY idx_like_author_video (author_id, video_id),
 			KEY idx_like_user (user_id)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE IF NOT EXISTS video_comments (
+			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+			author_id VARCHAR(64) NOT NULL,
+			video_id VARCHAR(128) NOT NULL,
+			user_id VARCHAR(64) NOT NULL,
+			content TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			KEY idx_comment_author_video (author_id, video_id),
+			KEY idx_comment_user (user_id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE IF NOT EXISTS video_favorites (
+			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+			user_id VARCHAR(64) NOT NULL,
+			author_id VARCHAR(64) NOT NULL,
+			video_id VARCHAR(128) NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE KEY uk_video_fav (user_id, author_id, video_id),
+			KEY idx_fav_author_video (author_id, video_id),
+			KEY idx_fav_user (user_id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 	}
 
 	for _, stmt := range statements {

@@ -2,26 +2,66 @@ package handlers
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
-	"sync"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 
 	"videofeed/mysql_client"
 )
 
 const sessionCookieName = "vf_session"
 
-var sessionStore = struct {
-	sync.RWMutex
-	byToken map[string]string
-}{
-	byToken: make(map[string]string),
+// jwtSecret 从环境变量读取，没有则用默认值。
+// 生产环境必须通过环境变量配置，避免硬编码泄露。
+func jwtSecret() []byte {
+	s := strings.TrimSpace(os.Getenv("JWT_SECRET"))
+	if s == "" {
+		s = "videofeed-medium-dev-secret"
+	}
+	return []byte(s)
+}
+
+// signJWT 签发 JWT，24 小时过期。
+// 只存 username 一个 claim，保持 token 轻量。
+func signJWT(username string) (string, error) {
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"sub": username,
+		"iat": now.Unix(),
+		"exp": now.Add(24 * time.Hour).Unix(),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(jwtSecret())
+}
+
+// verifyJWT 验证 JWT 签名和过期时间，返回 username。
+func verifyJWT(tokenStr string) (string, error) {
+	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return jwtSecret(), nil
+	})
+	if err != nil {
+		return "", err
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok || !token.Valid {
+		return "", fmt.Errorf("invalid token claims")
+	}
+	sub, _ := claims["sub"].(string)
+	if sub == "" {
+		return "", fmt.Errorf("missing sub claim")
+	}
+	return sub, nil
 }
 
 type accountRequest struct {
@@ -132,6 +172,12 @@ func Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 注册后自动签发 JWT，实现注册即登录
+	token, _ := signJWT(req.Username)
+	if token != "" {
+		setJWTCookie(w, token)
+	}
+
 	writeJSON(w, http.StatusOK, apiResponse{
 		Code: 0,
 		Msg:  "register success",
@@ -185,16 +231,12 @@ func Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := newSessionToken()
+	token, err := signJWT(req.Username)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "create session failed"})
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "create jwt failed"})
 		return
 	}
-
-	sessionStore.Lock()
-	sessionStore.byToken[token] = req.Username
-	sessionStore.Unlock()
-	setSessionCookie(w, token)
+	setJWTCookie(w, token)
 
 	writeJSON(w, http.StatusOK, apiResponse{
 		Code: 0,
@@ -209,12 +251,7 @@ func Logout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if cookie, err := r.Cookie(sessionCookieName); err == nil {
-		sessionStore.Lock()
-		delete(sessionStore.byToken, cookie.Value)
-		sessionStore.Unlock()
-	}
-	clearSessionCookie(w)
+	clearJWTCookie(w)
 	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Msg: "logout success"})
 }
 
@@ -572,10 +609,8 @@ func currentUsername(r *http.Request) (string, bool) {
 		return "", false
 	}
 
-	sessionStore.RLock()
-	username, ok := sessionStore.byToken[cookie.Value]
-	sessionStore.RUnlock()
-	if !ok {
+	username, err := verifyJWT(cookie.Value)
+	if err != nil {
 		return "", false
 	}
 	return username, true
@@ -586,26 +621,18 @@ func hashPassword(password string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func newSessionToken() (string, error) {
-	buf := make([]byte, 32)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(buf), nil
-}
-
-func setSessionCookie(w http.ResponseWriter, token string) {
+func setJWTCookie(w http.ResponseWriter, token string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		MaxAge:   7 * 24 * 60 * 60,
+		MaxAge:   24 * 60 * 60, // 24h，与 JWT 过期时间一致
 	})
 }
 
-func clearSessionCookie(w http.ResponseWriter) {
+func clearJWTCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -40,6 +41,9 @@ type videoDetail struct {
 	PublishTime    int64  `json:"publish_time"`
 	LikeCount      int64  `json:"like_count"`
 	Liked          bool   `json:"liked"`
+	CommentCount   int64  `json:"comment_count"`
+	Favorited      bool   `json:"favorited"`
+	FavoriteCount  int64  `json:"favorite_count"`
 }
 
 type videoRef struct {
@@ -53,6 +57,66 @@ func followersKey(userID string) string { return "relation:followers:" + userID 
 func inboxKey(userID string) string     { return "feed:inbox:" + userID }
 
 func inboxMember(authorID, videoID string) string { return authorID + "|" + videoID }
+
+func hotRankKey() string { return "feed:hot:rank" }
+
+// updateVideoHotScore 从 MySQL 查出当前点赞/评论/收藏数，按权重算分写入 Redis ZSet。
+//
+// 热榜权重公式（面试时可清晰讲出）：
+//
+//	score = 点赞数 × 10 + 收藏数 × 5 + 评论数 × 3
+//
+// 为什么用这个权重？
+// - 点赞是用户对内容的最直接认可，权重最高
+// - 收藏代表用户想反复观看，价值次之
+// - 评论只代表互动热度，不等于内容质量，权重最低
+//
+// 面试话术：
+// 「热榜用 Redis ZSet 实现，score 是按权重计算的综合热度分。
+//
+//	每次用户点赞、评论、收藏时异步更新对应视频的分数，
+//	查询时 ZREVRANGE 直接取 top N，O(log N) 复杂度。」
+func updateVideoHotScore(ctx context.Context, authorID, videoID string) {
+	c := redis_client.Get()
+	if c == nil {
+		return
+	}
+	db := mysql_client.Get()
+	if db == nil {
+		return
+	}
+
+	var likeCount, commentCount, favoriteCount int64
+	// 分别从三张表查总数 — 不用 JOIN 是为了每个查询都能走索引
+	_ = db.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM video_likes WHERE author_id = ? AND video_id = ?`,
+		authorID, videoID).Scan(&likeCount)
+	_ = db.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM video_comments WHERE author_id = ? AND video_id = ?`,
+		authorID, videoID).Scan(&commentCount)
+	_ = db.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM video_favorites WHERE author_id = ? AND video_id = ?`,
+		authorID, videoID).Scan(&favoriteCount)
+
+	score := float64(likeCount*10 + commentCount*3 + favoriteCount*5)
+	member := inboxMember(authorID, videoID)
+
+	if err := c.ZAdd(ctx, hotRankKey(), redis.Z{Score: score, Member: member}).Err(); err != nil {
+		log.Printf("update hot score failed, author=%s video=%s: %v", authorID, videoID, err)
+	}
+}
+
+// RemoveVideoFromHotRank 删除视频时从热榜 ZSet 中移除。
+func RemoveVideoFromHotRank(ctx context.Context, authorID, videoID string) {
+	c := redis_client.Get()
+	if c == nil {
+		return
+	}
+	member := inboxMember(authorID, videoID)
+	if err := c.ZRem(ctx, hotRankKey(), member).Err(); err != nil {
+		log.Printf("remove from hot rank failed, author=%s video=%s: %v", authorID, videoID, err)
+	}
+}
 
 func Follow(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -583,9 +647,40 @@ func HomeFeed(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Data: videos, NextCursor: nextCursor})
 }
 
+// feedProcessedKey 返回用于幂等去重的 key。
+//
+// 为什么需要去重？
+// - Worker 消费 MQ 消息时，如果 Ack 因网络抖动未送达 RabbitMQ
+// - RabbitMQ 会重新投递同一条消息，导致 Worker 重复消费
+// - 虽然 Redis ZADD 本身是幂等的（同 member+score 写两次结果一样）
+// - 但重复消费仍造成无意义的 Redis 写入，且面试时会追问「你如何保证不重复处理」
+// - 因此用 Redis SET NX 做一个「已处理标记」，24 小时过期防止 Set 膨胀
+//
+// 面试关键词：幂等消费、去重标记、Redis SETNX、TTL
+func feedProcessedKey(authorID, videoID string) string {
+	return "feed:processed:" + authorID + ":" + videoID
+}
+
 func FanoutToFollowers(ctx context.Context, authorID, videoID string, score int64) error {
 	c := redis_client.Get()
 	if c == nil {
+		return nil
+	}
+
+	// 幂等去重：用 SET NX + TTL 原子检查并标记已处理
+	// - 如果 key 已存在，说明这条消息已经被处理过，直接返回（幂等跳过）
+	// - 如果 key 不存在，SET NX 成功，继续执行扇出
+	//
+	// 面试话术：
+	// 「我用 Redis SET NX 对每条消息的 (author_id, video_id) 做去重标记，
+	//   带了 24 小时 TTL 防止 key 无限膨胀。
+	//   如果 SET NX 返回 false 说明已经处理过，直接跳过，保证幂等。」
+	ok, err := c.SetNX(ctx, feedProcessedKey(authorID, videoID), "1", 24*time.Hour).Result()
+	if err != nil {
+		log.Printf("fanout dedup check failed: %v", err)
+		// 去重检查失败时不阻塞主流程，继续执行（允许少量重复写入，保证可用性优先）
+	} else if !ok {
+		log.Printf("fanout dedup skip (already processed): author=%s video=%s", authorID, videoID)
 		return nil
 	}
 

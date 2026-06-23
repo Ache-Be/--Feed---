@@ -102,7 +102,12 @@ const uiHTML = `<!doctype html>
     .meta { font-size: 13px; color: #d1d5db; margin: 4px 0; line-height: 1.6; }
     .media { width: 100%; border-radius: 12px; background: #111827; margin-top: 8px; }
     .action-rail { display: flex; flex-direction: column; gap: 10px; align-items: center; pointer-events: auto; margin-left: 10px; flex-shrink: 0; }
-    .action-btn { width: 56px; height: 56px; border-radius: 999px; background: rgba(255,255,255,0.18); border: 1px solid rgba(255,255,255,0.28); color: white; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; font-size: 12px; }
+    .action-btn { width: 56px; height: 56px; border-radius: 999px; background: rgba(255,255,255,0.18); border: 1px solid rgba(255,255,255,0.28); color: white; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; font-size: 12px; cursor: pointer; }
+    .action-btn.secondary { background: rgba(255,255,255,0.18); color: white; border-color: rgba(255,255,255,0.28); }
+    .action-btn.liked { background: rgba(239,68,68,0.88); color: #fee2e2; border-color: #fca5a5; }
+    .action-btn.liked span:first-child { color: #fca5a5; }
+    .action-btn.favorited { background: rgba(234,179,8,0.88); color: #fef9c3; border-color: #fde047; }
+    .action-btn.favorited span:first-child { color: #fde047; }
     .action-btn span:first-child { font-size: 20px; line-height: 1; }
     .avatar-wrap { position: relative; width: 64px; height: 64px; }
     .avatar { width: 64px; height: 64px; border-radius: 999px; object-fit: cover; border: 2px solid rgba(255,255,255,0.7); background: rgba(255,255,255,0.12); }
@@ -163,6 +168,16 @@ const uiHTML = `<!doctype html>
     .detail-head h3 { margin: 0; }
     .detail-media { width: 100%; border-radius: 18px; background: #111827; max-height: 56vh; object-fit: cover; }
     .detail-text { color: #374151; line-height: 1.8; white-space: pre-wrap; }
+    .comment-panel { width: min(420px, 92vw); max-height: 70vh; background: white; border-radius: 22px; padding: 20px; box-shadow: 0 24px 64px rgba(15,23,42,0.32); display: flex; flex-direction: column; }
+    .comment-list { flex: 1; overflow-y: auto; margin: 12px 0; max-height: 42vh; }
+    .comment-item { padding: 10px 0; border-bottom: 1px solid #f3f4f6; }
+    .comment-item .comment-user { font-weight: 600; color: #1f2937; font-size: 14px; }
+    .comment-item .comment-text { color: #4b5563; font-size: 14px; margin-top: 2px; }
+    .comment-item .comment-meta { color: #9ca3af; font-size: 12px; margin-top: 2px; display: flex; justify-content: space-between; align-items: center; }
+    .comment-item .comment-del { background: none; border: 0; color: #ef4444; font-size: 12px; cursor: pointer; }
+    .comment-input-row { display: flex; gap: 8px; margin-top: 12px; }
+    .comment-input-row input { flex: 1; }
+    .comment-input-row button { flex-shrink: 0; }
     .cropper-backdrop { position: fixed; inset: 0; background: rgba(15,23,42,0.72); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 1000; }
     .cropper-backdrop.show { display: flex; }
     .cropper-modal { width: min(560px, 100%); background: white; border-radius: 22px; padding: 20px; box-shadow: 0 24px 64px rgba(15,23,42,0.32); }
@@ -392,24 +407,18 @@ const uiHTML = `<!doctype html>
               </div>
             </div>
 
-            <div class="profile-subgrid">
-              <div class="card">
-                <h3>当前账号</h3>
-                <div class="meta">已登录用户：<span id="currentUsername" class="mono"></span></div>
-                <div class="auth-switch">
-                  <button id="btnLogout" class="danger">退出登录</button>
-                </div>
+            <div class="card">
+              <div class="row" style="justify-content: space-between; align-items: center;">
+                <h3 style="margin:0;">我的关注</h3>
+                <button id="btnRefreshFollowingProfiles" class="secondary" type="button">刷新</button>
               </div>
-
-              <div class="card">
-                <div class="row" style="justify-content: space-between; align-items: center;">
-                  <h3 style="margin:0;">我的关注</h3>
-                  <button id="btnRefreshFollowingProfiles" class="secondary" type="button">刷新</button>
-                </div>
-                <div class="meta" style="color:#374151;">当前已关注 <span id="followingCount">0</span> 个用户</div>
-                <div id="followingList" class="account-follow-list">
-                  <div class="empty">登录后，这里会显示你关注的账号昵称和头像。</div>
-                </div>
+              <div class="meta" style="color:#374151;">当前已关注 <span id="followingCount">0</span> 个用户</div>
+              <div id="followingList" class="account-follow-list">
+                <div class="empty">登录后，这里会显示你关注的账号昵称和头像。</div>
+              </div>
+              <div class="auth-switch" style="margin-top: 16px; border-top: 1px solid #e5e7eb; padding-top: 12px;">
+                <button id="btnMyLikes" class="secondary" type="button">我的喜欢</button>
+                <button id="btnMyFavorites" class="secondary" type="button">我的收藏</button>
               </div>
             </div>
           </div>
@@ -425,6 +434,14 @@ const uiHTML = `<!doctype html>
                 <button id="btnChangePassword">确认改密码</button>
               </div>
               <div class="hint">如果忘记密码，可以先退出登录，再走“忘记密码”流程重置为 123456。</div>
+            </div>
+
+            <div class="card">
+              <h3>当前账号</h3>
+              <div class="meta">已登录用户：<span id="currentUsername" class="mono"></span></div>
+              <div class="auth-switch">
+                <button id="btnLogout" class="danger">退出登录</button>
+              </div>
             </div>
 
             <div class="card">
@@ -472,6 +489,28 @@ const uiHTML = `<!doctype html>
       </div>
     </div>
   </section>
+  <section id="myLikesPage" class="public-profile-page">
+    <div class="public-profile-shell">
+      <div class="public-profile-topbar">
+        <h2>我的喜欢</h2>
+        <button id="btnBackFromLikes" class="public-profile-back" type="button">返回账号</button>
+      </div>
+      <div id="myLikesList" class="published-grid">
+        <div class="empty">正在加载...</div>
+      </div>
+    </div>
+  </section>
+  <section id="myFavoritesPage" class="public-profile-page">
+    <div class="public-profile-shell">
+      <div class="public-profile-topbar">
+        <h2>我的收藏</h2>
+        <button id="btnBackFromFavorites" class="public-profile-back" type="button">返回账号</button>
+      </div>
+      <div id="myFavoritesList" class="published-grid">
+        <div class="empty">正在加载...</div>
+      </div>
+    </div>
+  </section>
   <div id="toast" class="toast"></div>
   <div id="detailSheetBackdrop" class="sheet-backdrop">
     <div class="detail-sheet">
@@ -513,6 +552,19 @@ const uiHTML = `<!doctype html>
       <div class="auth-switch">
         <button id="btnSaveVideoEdit" type="button">保存修改</button>
         <button id="btnDeleteVideo" class="danger" type="button">删除作品</button>
+      </div>
+    </div>
+  </div>
+  <div id="commentPanelBackdrop" class="sheet-backdrop">
+    <div class="comment-panel">
+      <div class="detail-head">
+        <h3 id="commentPanelTitle">评论</h3>
+        <button id="btnCloseCommentPanel" class="secondary" type="button">关闭</button>
+      </div>
+      <div id="commentList" class="comment-list"></div>
+      <div class="comment-input-row">
+        <input id="commentInput" type="text" placeholder="发表评论..." maxlength="500" />
+        <button id="btnSubmitComment" type="button">发送</button>
       </div>
     </div>
   </div>
@@ -571,6 +623,10 @@ const uiHTML = `<!doctype html>
     const publicProfileFollowersEl = document.getElementById("publicProfileFollowers");
     const publicProfileLikesEl = document.getElementById("publicProfileLikes");
     const publicProfileWorksEl = document.getElementById("publicProfileWorks");
+    const myLikesPageEl = document.getElementById("myLikesPage");
+    const myLikesListEl = document.getElementById("myLikesList");
+    const myFavoritesPageEl = document.getElementById("myFavoritesPage");
+    const myFavoritesListEl = document.getElementById("myFavoritesList");
     const detailSheetBackdropEl = document.getElementById("detailSheetBackdrop");
     const editVideoBackdropEl = document.getElementById("editVideoBackdrop");
     const detailSheetAuthorEl = document.getElementById("detailSheetAuthor");
@@ -960,7 +1016,13 @@ const uiHTML = `<!doctype html>
       item.like_count = detail.like_count;
       item.liked = detail.liked;
       triggerBtn.innerHTML = "<span>❤</span><span>" + String(detail.like_count || 0) + "</span>";
-      triggerBtn.classList.toggle("secondary", !detail.liked);
+      if (detail.liked) {
+        triggerBtn.classList.add("liked");
+        triggerBtn.classList.remove("secondary");
+      } else {
+        triggerBtn.classList.remove("liked");
+        triggerBtn.classList.add("secondary");
+      }
       updateVideoLikeInCards(detail.author_id, detail.video_id, detail.like_count || 0);
       if (detail.author_id === currentPublicProfileUserId) loadPublicProfile(detail.author_id);
       showToast(detail.liked ? "点赞成功" : "已取消点赞");
@@ -1072,6 +1134,135 @@ const uiHTML = `<!doctype html>
       await loadHot();
       if (currentPublicProfileUserId) await loadPublicProfile(currentPublicProfileUserId);
       showToast("作品已删除");
+    }
+
+    // ---- comment & favorite ----
+
+    let commentPanelItem = null;
+
+    function openCommentPanel(item) {
+      if (!currentUser || !currentUser.username) {
+        setActiveTab("account");
+        showToast("请先登录后再查看评论");
+        return;
+      }
+      commentPanelItem = item;
+      byId("commentPanelTitle").textContent = "评论 · " + (item.title || item.video_id || "");
+      byId("commentInput").value = "";
+      loadComments();
+      byId("commentPanelBackdrop").classList.add("show");
+    }
+
+    async function loadComments() {
+      if (!commentPanelItem) return;
+      const data = await getJSON("/video/comments?author_id=" + encodeURIComponent(commentPanelItem.author_id) + "&video_id=" + encodeURIComponent(commentPanelItem.video_id));
+      setOutput(data);
+      const listEl = byId("commentList");
+      listEl.replaceChildren();
+      if (data.code !== 0 || !Array.isArray(data.data)) return;
+      if (!data.data.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "暂无评论，快来抢沙发吧~";
+        listEl.appendChild(empty);
+        return;
+      }
+      data.data.forEach((c) => {
+        const div = document.createElement("div");
+        div.className = "comment-item";
+        const userEl = document.createElement("div");
+        userEl.className = "comment-user";
+        userEl.textContent = c.user_id || "匿名";
+        div.appendChild(userEl);
+        const textEl = document.createElement("div");
+        textEl.className = "comment-text";
+        textEl.textContent = c.content;
+        div.appendChild(textEl);
+        const meta = document.createElement("div");
+        meta.className = "comment-meta";
+        const time = document.createElement("span");
+        time.textContent = c.created_at || "";
+        meta.appendChild(time);
+        if (currentUser && currentUser.username === c.user_id) {
+          const delBtn = document.createElement("button");
+          delBtn.className = "comment-del";
+          delBtn.textContent = "删除";
+          delBtn.addEventListener("click", async () => {
+            const d = await postJSON("/video/comment/delete", { comment_id: c.id });
+            setOutput(d);
+            if (d.code === 0) {
+              if (commentPanelItem) commentPanelItem.comment_count = Math.max(0, (commentPanelItem.comment_count || 1) - 1);
+              loadComments();
+              refreshActiveCards();
+            } else showToast(d.msg || "删除评论失败");
+          });
+          meta.appendChild(delBtn);
+        }
+        div.appendChild(meta);
+        listEl.appendChild(div);
+      });
+    }
+
+    async function submitComment() {
+      if (!commentPanelItem) return;
+      const content = valueOf("commentInput").trim();
+      if (!content) {
+        showToast("请输入评论内容");
+        return;
+      }
+      const data = await postJSON("/video/comment", {
+        author_id: commentPanelItem.author_id,
+        video_id: commentPanelItem.video_id,
+        content,
+      });
+      setOutput(data);
+      if (data.code === 0) {
+        byId("commentInput").value = "";
+        if (commentPanelItem) {
+          commentPanelItem.comment_count = (commentPanelItem.comment_count || 0) + 1;
+          refreshActiveCards();
+        }
+        loadComments();
+        showToast("评论已发布");
+      } else {
+        showToast(data.msg || "评论失败");
+      }
+    }
+
+    function refreshActiveCards() {
+      if (activeTab === "recommend") renderCards(recommendCardsEl, recommendItems);
+    }
+
+    async function toggleVideoFavorite(item, triggerBtn) {
+      if (!currentUser || !currentUser.username) {
+        setActiveTab("account");
+        showToast("请先登录后再收藏");
+        return;
+      }
+      if (!item || !item.author_id || !item.video_id) return;
+      if (triggerBtn) triggerBtn.disabled = true;
+      const data = await postJSON(item.favorited ? "/video/unfavorite" : "/video/favorite", {
+        author_id: item.author_id,
+        video_id: item.video_id,
+      });
+      setOutput(data);
+      if (triggerBtn) triggerBtn.disabled = false;
+      if (data.code !== 0 || !data.data) {
+        showToast(data.msg || "收藏操作失败");
+        return;
+      }
+      const detail = decorate(data.data);
+      item.favorited = detail.favorited;
+      item.favorite_count = detail.favorite_count;
+      triggerBtn.innerHTML = "<span>" + (detail.favorited ? "★" : "☆") + "</span><span>" + String(detail.favorite_count || 0) + "</span>";
+      if (detail.favorited) {
+        triggerBtn.classList.add("favorited");
+        triggerBtn.classList.remove("secondary");
+      } else {
+        triggerBtn.classList.remove("favorited");
+        triggerBtn.classList.add("secondary");
+      }
+      showToast(detail.favorited ? "已收藏" : "已取消收藏");
     }
 
     function renderMyVideos(items) {
@@ -1243,6 +1434,102 @@ const uiHTML = `<!doctype html>
       }
     }
 
+    async function openMyLikes() {
+      if (!currentUser || !currentUser.username) {
+        showToast("请先登录");
+        return;
+      }
+      myLikesPageEl.classList.add("show");
+      const data = await getJSON("/video/likes");
+      setOutput(data);
+      myLikesListEl.replaceChildren();
+      if (data.code !== 0 || !Array.isArray(data.data) || !data.data.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "你还没有点过赞的视频。";
+        myLikesListEl.appendChild(empty);
+        return;
+      }
+      for (const item of data.data) {
+        try {
+          const detail = await getJSON("/video/detail?author_id=" + encodeURIComponent(item.author_id) + "&video_id=" + encodeURIComponent(item.video_id));
+          if (detail.code !== 0 || !detail.data) continue;
+          const d = decorate(detail.data);
+          const card = document.createElement("div");
+          card.className = "published-item";
+          card.addEventListener("click", () => {
+            closeMyLikes();
+            openVideoInFeed(d.author_id, d.video_id);
+          });
+          const cover = document.createElement("img");
+          cover.className = "published-cover";
+          cover.src = d.cover_url || DEFAULT_AVATAR;
+          cover.alt = d.video_id || "cover";
+          card.appendChild(cover);
+          const meta = document.createElement("div");
+          meta.className = "published-meta";
+          const likeSpan = document.createElement("span");
+          likeSpan.className = "published-like";
+          likeSpan.textContent = "❤ " + (d.like_count || 0);
+          meta.appendChild(likeSpan);
+          card.appendChild(meta);
+          myLikesListEl.appendChild(card);
+        } catch (_) {}
+      }
+    }
+
+    function closeMyLikes() {
+      myLikesPageEl.classList.remove("show");
+    }
+
+    async function openMyFavorites() {
+      if (!currentUser || !currentUser.username) {
+        showToast("请先登录");
+        return;
+      }
+      myFavoritesPageEl.classList.add("show");
+      const data = await getJSON("/video/favorites");
+      setOutput(data);
+      myFavoritesListEl.replaceChildren();
+      if (data.code !== 0 || !Array.isArray(data.data) || !data.data.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "你还没有收藏过视频。";
+        myFavoritesListEl.appendChild(empty);
+        return;
+      }
+      for (const item of data.data) {
+        try {
+          const detail = await getJSON("/video/detail?author_id=" + encodeURIComponent(item.author_id) + "&video_id=" + encodeURIComponent(item.video_id));
+          if (detail.code !== 0 || !detail.data) continue;
+          const d = decorate(detail.data);
+          const card = document.createElement("div");
+          card.className = "published-item";
+          card.addEventListener("click", () => {
+            closeMyFavorites();
+            openVideoInFeed(d.author_id, d.video_id);
+          });
+          const cover = document.createElement("img");
+          cover.className = "published-cover";
+          cover.src = d.cover_url || DEFAULT_AVATAR;
+          cover.alt = d.video_id || "cover";
+          card.appendChild(cover);
+          const meta = document.createElement("div");
+          meta.className = "published-meta";
+          const favSpan = document.createElement("span");
+          favSpan.className = "published-like";
+          favSpan.textContent = "★ " + (d.favorite_count || 0);
+          meta.appendChild(favSpan);
+          card.appendChild(meta);
+          myFavoritesListEl.appendChild(card);
+        } catch (_) {}
+      }
+    }
+
+    function closeMyFavorites() {
+      myFavoritesPageEl.classList.remove("show");
+    }
+
     async function toggleFollowAuthor(targetUserId, targetLabel, triggerBtn) {
       if (!currentUser || !currentUser.username) {
         setActiveTab("account");
@@ -1323,19 +1610,28 @@ const uiHTML = `<!doctype html>
         const actionRail = document.createElement("div");
         actionRail.className = "video-action-rail";
         const likeBtn = document.createElement("button");
-        likeBtn.className = "action-btn" + (item.liked ? "" : " secondary");
+        likeBtn.className = "action-btn" + (item.liked ? " liked" : " secondary");
         likeBtn.type = "button";
         likeBtn.innerHTML = "<span>❤</span><span>" + String(item.like_count || 0) + "</span>";
         likeBtn.addEventListener("click", () => toggleVideoLike(item, likeBtn));
         actionRail.appendChild(likeBtn);
-        [["💬", "评论"], ["★", "收藏"]].forEach(([icon, label]) => {
-          const btn = document.createElement("button");
-          btn.className = "action-btn";
-          btn.type = "button";
-          btn.innerHTML = "<span>" + icon + "</span><span>" + label + "</span>";
-          btn.addEventListener("click", () => showToast(label + "功能后续再接"));
-          actionRail.appendChild(btn);
-        });
+
+        // Comment button
+        const commentBtn = document.createElement("button");
+        commentBtn.className = "action-btn";
+        commentBtn.type = "button";
+        commentBtn.innerHTML = "<span>💬</span><span>" + String(item.comment_count || 0) + "</span>";
+        commentBtn.addEventListener("click", () => openCommentPanel(item));
+        actionRail.appendChild(commentBtn);
+
+        // Favorite button
+        const favBtn = document.createElement("button");
+        favBtn.className = "action-btn" + (item.favorited ? " favorited" : " secondary");
+        favBtn.type = "button";
+        favBtn.innerHTML = "<span>" + (item.favorited ? "★" : "☆") + "</span><span>" + String(item.favorite_count || 0) + "</span>";
+        favBtn.addEventListener("click", () => toggleVideoFavorite(item, favBtn));
+        actionRail.appendChild(favBtn);
+
         stage.appendChild(actionRail);
 
         const overlay = document.createElement("div");
@@ -1837,6 +2133,23 @@ const uiHTML = `<!doctype html>
     byId("btnUploadEditVideo").addEventListener("click", () => uploadEditVideoSource());
     byId("btnSaveVideoEdit").addEventListener("click", () => saveVideoEdit());
     byId("btnDeleteVideo").addEventListener("click", () => deleteVideoByEditing());
+    byId("btnCloseCommentPanel").addEventListener("click", () => {
+      byId("commentPanelBackdrop").classList.remove("show");
+      commentPanelItem = null;
+    });
+    byId("commentPanelBackdrop").addEventListener("click", (event) => {
+      if (event.target === byId("commentPanelBackdrop")) {
+        byId("commentPanelBackdrop").classList.remove("show");
+        commentPanelItem = null;
+      }
+    });
+    byId("btnSubmitComment").addEventListener("click", () => submitComment());
+    byId("commentInput").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        submitComment();
+      }
+    });
     byId("btnLogin").addEventListener("click", () => login());
     byId("btnRegister").addEventListener("click", () => register());
     byId("btnLoadQuestion").addEventListener("click", () => loadSecurityQuestion());
@@ -1845,6 +2158,10 @@ const uiHTML = `<!doctype html>
     byId("btnChangePassword").addEventListener("click", () => changePassword());
     byId("btnLogout").addEventListener("click", () => logout());
     byId("btnBackFromProfile").addEventListener("click", () => closePublicProfile());
+    byId("btnBackFromLikes").addEventListener("click", () => closeMyLikes());
+    byId("btnBackFromFavorites").addEventListener("click", () => closeMyFavorites());
+    byId("btnMyLikes").addEventListener("click", () => openMyLikes());
+    byId("btnMyFavorites").addEventListener("click", () => openMyFavorites());
     byId("btnToRegister").addEventListener("click", () => setGuestView("register"));
     byId("btnToRecover").addEventListener("click", () => setGuestView("recover"));
     byId("btnBackToLogin1").addEventListener("click", () => setGuestView("login"));
