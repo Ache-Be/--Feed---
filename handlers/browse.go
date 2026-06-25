@@ -3,11 +3,14 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	"videofeed/cache"
 	"videofeed/mysql_client"
 	"videofeed/redis_client"
 )
@@ -96,9 +99,10 @@ func Hot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 无搜索 → 优先走 Redis ZSet 热榜（权重已预先计算好）
+	// 热榜按分钟分桶存储，读取时 ZUNIONSTORE 合并最近 60 个桶
 	c := redis_client.Get()
 	if c != nil {
-		zs, err := c.ZRevRangeWithScores(r.Context(), hotRankKey(), 0, limit-1).Result()
+		zs, err := MergeHotBuckets(r.Context(), c, limit)
 		if err == nil && len(zs) > 0 {
 			videoRefs := make([]videoRef, 0, len(zs))
 			for _, z := range zs {
@@ -123,6 +127,27 @@ func Hot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Redis 挂了 or ZSet 为空 → MySQL 降级
+	// 用分布式锁保护降级路径，防止同一时刻大量请求同时打到 MySQL
+	if c != nil {
+		hotJSON, lockErr := cache.FetchWithLock(r.Context(), "cache:hot:rank", 2*time.Minute, func() (string, error) {
+			videos, err := queryHotVideosFromMySQL(r, "", limit)
+			if err != nil {
+				return "", err
+			}
+			currentUser, _ := currentUsername(r)
+			_ = attachLikeStatsToVideos(r.Context(), currentUser, videos)
+			b, _ := json.Marshal(videos)
+			return string(b), nil
+		})
+		if lockErr == nil {
+			var videos []videoDetail
+			_ = json.Unmarshal([]byte(hotJSON), &videos)
+			writeJSON(w, http.StatusOK, apiResponse{Code: 0, Data: videos})
+			return
+		}
+		// 锁获取失败或缓存异常，降级直查 MySQL
+	}
+
 	videos, err := queryHotVideosFromMySQL(r, "", limit)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "query hot failed"})

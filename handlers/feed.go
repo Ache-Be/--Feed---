@@ -19,6 +19,14 @@ import (
 	"videofeed/redis_client"
 )
 
+// EMPTY_DB 占位符和 TTL，用于缓存穿透防护。
+// 当 MySQL 查询结果为空时，在 Redis 中写入此标记，
+// 后续请求直接返回空，不再穿透到 MySQL。
+const (
+	emptyPlaceholder    = "__CACHE_EMPTY__"
+	emptyPlaceholderTTL = 10 * time.Second
+)
+
 type followRequest struct {
 	UserID       string `json:"user_id"`
 	TargetUserID string `json:"target_user_id"`
@@ -58,7 +66,78 @@ func inboxKey(userID string) string     { return "feed:inbox:" + userID }
 
 func inboxMember(authorID, videoID string) string { return authorID + "|" + videoID }
 
-func hotRankKey() string { return "feed:hot:rank" }
+// ---------- 热榜时间窗口 ----------
+//
+// 热榜不再用单个 ZSet，而是按分钟分桶：
+//   key: hot:1m:{YYYYMMDDHHmm}
+//   member: authorID|videoID
+//   score: 点赞×10 + 收藏×5 + 评论×3
+//
+// 为什么这么做？
+// - 单个 ZSet 会无限膨胀，旧数据永远不消失
+// - 分钟分桶后，每分钟的数据量是可控的
+// - 旧桶设置 TTL 自动过期，Redis 内存自动回收
+// - 合并时用 ZUNIONSTORE 聚合多个桶，天然得到"近 x 分钟热榜"
+
+const (
+	// HotBucketPrefix 热榜分钟分桶 key 前缀。
+	HotBucketPrefix = "hot:1m:"
+	// HotBucketTTL 每个分桶的 TTL，2 小时后自动过期。
+	HotBucketTTL = 2 * time.Hour
+	// HotMergeWindow 合并的窗口数 = 60 分钟（1 小时）。
+	HotMergeWindow = 60
+	// HotMergeResultKey 合并结果的临时 key。
+	HotMergeResultKey = "hot:merge:result"
+	// HotMergeResultTTL 合并结果的 TTL，只需短暂存活供读取。
+	HotMergeResultTTL = 10 * time.Second
+)
+
+// hotBucketKey 返回当前时间所在的分钟分桶 key。
+// 格式：hot:1m:202606241315（精确到分钟）
+func hotBucketKey() string {
+	return HotBucketPrefix + time.Now().Format("200601021504")
+}
+
+// hotBucketKeyFor 返回指定时间所在的分钟分桶 key（用于删除等操作）。
+func hotBucketKeyFor(t time.Time) string {
+	return HotBucketPrefix + t.Format("200601021504")
+}
+
+// MergeHotBuckets 合并最近 N 个分钟分桶到临时 key，返回合并后的结果。
+//
+// 用 ZUNIONSTORE 合并 N 个桶，score 相加。
+// 同一个视频在多个桶里都有分数，合并后总分数 = 各桶分数之和。
+// 合并结果存到临时 key，设 10s TTL，读取完后删除。
+func MergeHotBuckets(ctx context.Context, c *redis.Client, limit int64) ([]redis.Z, error) {
+	// 收集最近 N 个桶的 key
+	now := time.Now()
+	keys := make([]string, 0, HotMergeWindow)
+	for i := 0; i < HotMergeWindow; i++ {
+		t := now.Add(-time.Duration(i) * time.Minute)
+		keys = append(keys, hotBucketKeyFor(t))
+	}
+
+	// ZUNIONSTORE 合并
+	// WEIGHTS 1 表示所有桶权重相同，score 直接相加
+	err := c.ZUnionStore(ctx, HotMergeResultKey, &redis.ZStore{
+		Keys:    keys,
+		Weights: []float64{1},
+	}).Err()
+	if err != nil {
+		return nil, err
+	}
+
+	// 给合并结果设 TTL，自动清理
+	c.Expire(ctx, HotMergeResultKey, HotMergeResultTTL)
+
+	// 从合并结果中取 top N
+	zs, err := c.ZRevRangeWithScores(ctx, HotMergeResultKey, 0, limit-1).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	return zs, nil
+}
 
 // updateVideoHotScore 从 MySQL 查出当前点赞/评论/收藏数，按权重算分写入 Redis ZSet。
 //
@@ -101,21 +180,25 @@ func updateVideoHotScore(ctx context.Context, authorID, videoID string) {
 	score := float64(likeCount*10 + commentCount*3 + favoriteCount*5)
 	member := inboxMember(authorID, videoID)
 
-	if err := c.ZAdd(ctx, hotRankKey(), redis.Z{Score: score, Member: member}).Err(); err != nil {
+	// 写入当前分钟分桶
+	key := hotBucketKey()
+	if err := c.ZAdd(ctx, key, redis.Z{Score: score, Member: member}).Err(); err != nil {
 		log.Printf("update hot score failed, author=%s video=%s: %v", authorID, videoID, err)
 	}
+	// 设 TTL，防止分桶无限堆积
+	c.Expire(ctx, key, HotBucketTTL)
 }
 
-// RemoveVideoFromHotRank 删除视频时从热榜 ZSet 中移除。
+// RemoveVideoFromHotRank 删除视频时从当前分钟分桶中移除。
 func RemoveVideoFromHotRank(ctx context.Context, authorID, videoID string) {
 	c := redis_client.Get()
 	if c == nil {
 		return
 	}
 	member := inboxMember(authorID, videoID)
-	if err := c.ZRem(ctx, hotRankKey(), member).Err(); err != nil {
-		log.Printf("remove from hot rank failed, author=%s video=%s: %v", authorID, videoID, err)
-	}
+	// 从当前分钟分桶和合并结果中同时移除
+	_ = c.ZRem(ctx, hotBucketKey(), member).Err()
+	_ = c.ZRem(ctx, HotMergeResultKey, member).Err()
 }
 
 func Follow(w http.ResponseWriter, r *http.Request) {
@@ -177,10 +260,13 @@ func Follow(w http.ResponseWriter, r *http.Request) {
 			_ = c.Del(r.Context(), followingKey(req.UserID), followersKey(req.TargetUserID)).Err()
 		}
 
+		// 清除 EMPTY_DB 标记：用户关注了人，inbox 可能有数据了
+		emptyMarker := "feed:empty:inbox:" + req.UserID
 		if err := backfillInboxFromOutbox(r.Context(), req.UserID, req.TargetUserID, 50); err != nil {
 			log.Printf("follow inbox backfill skipped: %v", err)
 			_ = c.Del(r.Context(), inboxKey(req.UserID)).Err()
 		}
+		_ = c.Del(r.Context(), emptyMarker).Err()
 	}
 
 	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Msg: "success"})
@@ -338,6 +424,16 @@ func Feed(w http.ResponseWriter, r *http.Request) {
 	c := redis_client.Get()
 	key := "feed:timeline:" + userID
 	if c != nil {
+		// EMPTY_DB 缓存穿透防护：如果之前 MySQL 查过是空的，直接返回空
+		emptyMarker := "feed:empty:timeline:" + userID
+		if !hasCursor {
+			exists, _ := c.Exists(r.Context(), emptyMarker).Result()
+			if exists == 1 {
+				// MySQL 之前返回过空，不重复查询，直接返回空列表
+				writeJSON(w, http.StatusOK, apiResponse{Code: 0, Data: []videoDetail{}, NextCursor: nil})
+				return
+			}
+		}
 		// Redis ZREVRANGEBYSCORE：按 score 从大到小（倒序）取出 member 列表（可带 LIMIT）。
 		//
 		// 路线 A（严谨版游标）实现思路：
@@ -420,13 +516,19 @@ func Feed(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		collected = items
-		if c != nil && len(items) > 0 {
-			_, _ = c.TxPipelined(r.Context(), func(p redis.Pipeliner) error {
-				for _, it := range items {
-					p.ZAdd(r.Context(), key, redis.Z{Score: float64(it.score), Member: it.videoID})
-				}
-				return nil
-			})
+		if c != nil {
+			if len(items) > 0 {
+				_, _ = c.TxPipelined(r.Context(), func(p redis.Pipeliner) error {
+					for _, it := range items {
+						p.ZAdd(r.Context(), key, redis.Z{Score: float64(it.score), Member: it.videoID})
+					}
+					return nil
+				})
+			} else if !hasCursor {
+				// EMPTY_DB：MySQL 也返回空，写入占位符防穿透
+				emptyMarker := "feed:empty:timeline:" + userID
+				_ = c.Set(r.Context(), emptyMarker, emptyPlaceholder, emptyPlaceholderTTL).Err()
+			}
 		}
 	}
 
@@ -519,6 +621,15 @@ func HomeFeed(w http.ResponseWriter, r *http.Request) {
 	c := redis_client.Get()
 	key := inboxKey(userID)
 	if c != nil {
+		// EMPTY_DB 缓存穿透防护
+		emptyMarker := "feed:empty:inbox:" + userID
+		if !hasCursor {
+			exists, _ := c.Exists(r.Context(), emptyMarker).Result()
+			if exists == 1 {
+				writeJSON(w, http.StatusOK, apiResponse{Code: 0, Data: []videoDetail{}, NextCursor: nil})
+				return
+			}
+		}
 		currentHasCursor := hasCursor
 		currentScore := cursorScore
 		currentMember := cursorVideoID
@@ -593,16 +704,22 @@ func HomeFeed(w http.ResponseWriter, r *http.Request) {
 				score:  row.PublishTime,
 			})
 		}
-		if c != nil && len(rows) > 0 {
-			_, _ = c.TxPipelined(r.Context(), func(p redis.Pipeliner) error {
-				for _, row := range rows {
-					p.ZAdd(r.Context(), key, redis.Z{
-						Score:  float64(row.PublishTime),
-						Member: inboxMember(row.AuthorID, row.VideoID),
-					})
-				}
-				return nil
-			})
+		if c != nil {
+			if len(rows) > 0 {
+				_, _ = c.TxPipelined(r.Context(), func(p redis.Pipeliner) error {
+					for _, row := range rows {
+						p.ZAdd(r.Context(), key, redis.Z{
+							Score:  float64(row.PublishTime),
+							Member: inboxMember(row.AuthorID, row.VideoID),
+						})
+					}
+					return nil
+				})
+			} else if !hasCursor {
+				// EMPTY_DB 缓存穿透防护
+				emptyMarker := "feed:empty:inbox:" + userID
+				_ = c.Set(r.Context(), emptyMarker, emptyPlaceholder, emptyPlaceholderTTL).Err()
+			}
 		}
 	}
 

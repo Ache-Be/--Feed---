@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
+	"videofeed/cache"
 	"videofeed/mysql_client"
 	"videofeed/redis_client"
 )
@@ -259,15 +261,33 @@ func VideoDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	currentUser, _ := currentUsername(r)
-	detail, err := loadVideoDetailByID(r.Context(), authorID, videoID, currentUser)
+
+	// 缓存击穿防护：热点视频用 singleflight 合并并发请求
+	// key 格式：cache:video:{author_id}:{video_id}
+	cacheKey := fmt.Sprintf("cache:video:%s:%s", authorID, videoID)
+	detailJSON, err := cache.Fetch(r.Context(), cacheKey, 30*time.Second, func() (string, error) {
+		detail, err := loadVideoDetailByID(r.Context(), authorID, videoID, currentUser)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				// 视频不存在，返回空字符串，cache.Fetch 会写入 EMPTY_DB
+				return "", nil
+			}
+			return "", err
+		}
+		b, _ := json.Marshal(detail)
+		return string(b), nil
+	})
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if err == cache.ErrNotFound {
 			writeJSON(w, http.StatusNotFound, apiResponse{Code: 1, Msg: "video not found"})
 			return
 		}
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "load video detail failed"})
 		return
 	}
+
+	var detail videoDetail
+	_ = json.Unmarshal([]byte(detailJSON), &detail)
 	writeJSON(w, http.StatusOK, apiResponse{Code: 0, Data: detail})
 }
 
@@ -470,7 +490,8 @@ func DeleteVideo(w http.ResponseWriter, r *http.Request) {
 		_, _ = c.TxPipelined(r.Context(), func(p redis.Pipeliner) error {
 			p.ZRem(r.Context(), "feed:timeline:"+userID, req.VideoID)
 			p.ZRem(r.Context(), inboxKey(userID), member)
-			p.ZRem(r.Context(), hotRankKey(), member)
+			p.ZRem(r.Context(), hotBucketKey(), member)
+			p.ZRem(r.Context(), HotMergeResultKey, member)
 			return nil
 		})
 		if followers, err := loadFollowers(r.Context(), userID); err == nil && len(followers) > 0 {
