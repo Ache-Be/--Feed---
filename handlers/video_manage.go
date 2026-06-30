@@ -311,6 +311,14 @@ func handleVideoLikeMutation(w http.ResponseWriter, r *http.Request, like bool) 
 		return
 	}
 
+	// 限流：每个用户每秒最多点赞 10 次，Lua 脚本原子执行
+	if c := redis_client.Get(); c != nil {
+		if !cache.RateLimit(r.Context(), c, "ratelimit:like:"+userID, 1000, 10) {
+			writeJSON(w, http.StatusTooManyRequests, apiResponse{Code: 1, Msg: "too many requests, slow down"})
+			return
+		}
+	}
+
 	var req videoLikeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, apiResponse{Code: 1, Msg: "invalid json"})
@@ -420,6 +428,9 @@ func UpdateVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 更新后清除缓存，避免返回 stale 数据
+	cache.Evict(r.Context(), fmt.Sprintf("cache:video:%s:%s", userID, req.VideoID))
+
 	detail, err := loadVideoDetailByID(r.Context(), userID, req.VideoID, userID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "reload updated video failed"})
@@ -475,6 +486,9 @@ func DeleteVideo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, apiResponse{Code: 1, Msg: "video not found"})
 		return
 	}
+
+	// 删除后清除缓存，避免下次查询返回已删除的数据
+	cache.Evict(r.Context(), fmt.Sprintf("cache:video:%s:%s", userID, req.VideoID))
 
 	if _, err := db.ExecContext(r.Context(),
 		`DELETE FROM video_likes

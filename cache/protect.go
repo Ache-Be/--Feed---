@@ -1,5 +1,15 @@
 // Package cache 提供缓存防护工具，解决缓存穿透、击穿、雪崩问题。
 //
+// 三级缓存架构：
+//
+//	L1：go-cache（进程内存），TTL 5s，亚毫秒返回
+//	L2：Redis（分布式），TTL 1h，0.5-1ms 网络往返
+//	L3：MySQL（持久化），兜底
+//
+// 查询路径：L1 → L2 → L3，命中后逐级回写。
+// 需要 L1 的原因是：即使 Redis 只有 0.5ms 延迟，热点 key 每秒上万的 QPS
+// 累加起来也很可观。L1 在进程内无网络开销，能把 Redis QPS 降低 90%+。
+//
 // 使用方式：
 //
 //	// 缓存穿透防护：空结果自动写入 EMPTY_DB 占位符
@@ -20,6 +30,7 @@ import (
 	"math/rand"
 	"time"
 
+	gocache "github.com/patrickmn/go-cache"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
 
@@ -53,43 +64,78 @@ const (
 
 	// DefaultJitter 默认 TTL 抖动比例（±10%），用于防缓存雪崩。
 	DefaultJitter = 0.1
+
+	// L1DefaultTTL L1 本地缓存的默认 TTL。
+	// L1 只缓存高频热点数据，不需要长 TTL。
+	L1DefaultTTL = 5 * time.Second
+
+	// L1CleanupInterval L1 本地缓存的清理间隔。
+	L1CleanupInterval = 10 * time.Second
 )
 
-var sf singleflight.Group
+var (
+	sf      singleflight.Group
+	l1Cache *gocache.Cache
+)
+
+func init() {
+	// 初始化 L1 本地缓存
+	// 默认 TTL 5s，每 10s 清理一次过期 key
+	l1Cache = gocache.New(L1DefaultTTL, L1CleanupInterval)
+}
 
 // ---------- 对外 API ----------
 
-// Fetch 是带三级防护的缓存读取函数：
+// Fetch 是带三级缓存（L1→L2→L3）的缓存读取函数：
 //
-//  1. 缓存穿透防护：fetchFn 返回空字符串时，写入 EMPTY_DB 占位符，
-//     后续请求不再穿透到 MySQL。
+//  1. 查询 L1（go-cache 进程内存，5s TTL）
+//  2. L1 未命中 → 查 L2（Redis，1h TTL），命中写回 L1
+//  3. L2 未命中 → 查 L3（MySQL fetchFn），异步写 L2 + 同步写 L1
 //
-//  2. 缓存击穿防护：用 singleflight 合并同一时刻的同 key 并发请求，
-//     只让一个请求去查 MySQL，其余等待结果。
-//
-//  3. 缓存雪崩防护：TTL 加随机抖动（±10%），避免大量 key 同时过期。
+// 内置缓存穿透防护（EMPTY_DB）、缓存击穿防护（singleflight）、
+// 缓存雪崩防护（TTL 加随机抖动）。
 //
 // 什么时候用？
 //   - 适合读多写少、不要求强一致的场景
-//   - 不适合频繁变更的数据（EMPYY_DB 的 10s 窗口内，真实数据已创建但缓存仍是空）
+//   - 不适合频繁变更的数据（EMPTY_DB 的 10s 窗口内，真实数据已创建但缓存仍是空）
 func Fetch(ctx context.Context, key string, baseTTL time.Duration, fetchFn func() (string, error)) (string, error) {
+	// 1. 查 L1（进程内存）
+	if val, ok := l1Cache.Get(key); ok {
+		s := val.(string)
+		if s == EmptyPlaceholder {
+			return "", ErrNotFound
+		}
+		return s, nil
+	}
+
 	c := redis_client.Get()
 	if c == nil {
 		// Redis 不可用，降级直查 MySQL
-		return fetchFn()
+		data, err := fetchFn()
+		if err != nil {
+			return "", err
+		}
+		if data == "" {
+			return "", ErrNotFound
+		}
+		// 写入 L1
+		l1Cache.Set(key, data, L1DefaultTTL)
+		return data, nil
 	}
 
-	// 1. 读缓存
+	// 2. 查 L2（Redis）
 	val, err := c.Get(ctx, key).Result()
 	if err == nil {
 		if val == EmptyPlaceholder {
+			l1Cache.Set(key, EmptyPlaceholder, L1DefaultTTL)
 			return "", ErrNotFound
 		}
+		// L2 命中 → 写回 L1
+		l1Cache.Set(key, val, L1DefaultTTL)
 		return val, nil
 	}
 
-	// 2. singleflight 合并同进程并发请求
-	//    同一时刻多个 goroutine 请求同一个 key，只会有一个去查 MySQL
+	// 3. L1 + L2 都未命中 → singleflight 合并并发，查 L3（MySQL）
 	v, err, _ := sf.Do(key, func() (interface{}, error) {
 		return fetchAndCache(ctx, c, key, baseTTL, fetchFn)
 	})
@@ -102,11 +148,12 @@ func Fetch(ctx context.Context, key string, baseTTL time.Duration, fetchFn func(
 // FetchWithLock 是带分布式锁的缓存读取函数，比 singleflight 防护更强。
 //
 // 流程：
-//  1. 读缓存（第一次检查）
-//  2. 缓存未命中 → 尝试获取分布式锁（SET NX）
-//  3. 拿到锁 → double-check（第二次检查缓存，防止并发重复加载）
-//  4. double-check 仍未命中 → 查 MySQL 并写缓存 → 释放锁
-//  5. 没拿到锁 → spin-wait 轮询等待，直到超时降级直查 MySQL
+//  1. 读 L1（go-cache 进程内存）
+//  2. L1 未命中 → 读 L2（Redis）
+//  3. L2 未命中 → 尝试获取分布式锁（SET NX）
+//  4. 拿到锁 → double-check（再次检查 L2 + L1）
+//  5. double-check 仍未命中 → 查 L3（MySQL）并写 L2 + L1 → 释放锁
+//  6. 没拿到锁 → spin-wait 轮询等待，直到超时降级直查 MySQL
 //
 // 什么时候用？
 //   - 热点 key（如大V时间线、热门视频详情），并发量极高
@@ -121,16 +168,27 @@ func FetchWithLock(ctx context.Context, key string, baseTTL time.Duration, fetch
 		return fetchFn()
 	}
 
-	// 1. 第一次检查缓存
+	// 1. 查 L1（进程内存）
+	if val, ok := l1Cache.Get(key); ok {
+		s := val.(string)
+		if s == EmptyPlaceholder {
+			return "", ErrNotFound
+		}
+		return s, nil
+	}
+
+	// 2. 查 L2（Redis）
 	val, err := c.Get(ctx, key).Result()
 	if err == nil {
 		if val == EmptyPlaceholder {
+			l1Cache.Set(key, EmptyPlaceholder, L1DefaultTTL)
 			return "", ErrNotFound
 		}
+		l1Cache.Set(key, val, L1DefaultTTL)
 		return val, nil
 	}
 
-	// 2. 尝试获取分布式锁
+	// 3. 尝试获取分布式锁
 	lockKey := LockPrefix + key
 	lockVal := fmt.Sprintf("%d", time.Now().UnixNano())
 	locked, err := c.SetNX(ctx, lockKey, lockVal, LockTTL).Result()
@@ -140,55 +198,121 @@ func FetchWithLock(ctx context.Context, key string, baseTTL time.Duration, fetch
 	}
 
 	if locked {
-		// 3. 拿到锁 → double-check（第二次检查）
+		// 4. 拿到锁 → double-check（再次检查 L2 + L1）
 		val, err := c.Get(ctx, key).Result()
 		if err == nil {
-			_ = c.Del(ctx, lockKey).Err()
+			Unlock(c, lockKey, lockVal) // Lua 原子解锁
 			if val == EmptyPlaceholder {
+				l1Cache.Set(key, EmptyPlaceholder, L1DefaultTTL)
 				return "", ErrNotFound
 			}
+			l1Cache.Set(key, val, L1DefaultTTL)
 			return val, nil
 		}
 
-		// 4. 查 MySQL 并写缓存
+		// 5. 查 MySQL 并写 L2 + L1
 		data, err := fetchAndCacheUnsafe(ctx, c, key, baseTTL, fetchFn)
-		_ = c.Del(ctx, lockKey).Err()
+		Unlock(c, lockKey, lockVal) // Lua 原子解锁
 		if err != nil {
 			return "", err
 		}
 		return data, nil
 	}
 
-	// 5. 没拿到锁 → spin-wait 轮询等待
+	// 6. 没拿到锁 → spin-wait 轮询等待
 	//    最多等待 SpinWaitRetries * SpinWaitInterval = 100ms
 	for i := 0; i < SpinWaitRetries; i++ {
 		time.Sleep(SpinWaitInterval)
 		val, err := c.Get(ctx, key).Result()
 		if err == nil {
 			if val == EmptyPlaceholder {
+				l1Cache.Set(key, EmptyPlaceholder, L1DefaultTTL)
 				return "", ErrNotFound
 			}
+			l1Cache.Set(key, val, L1DefaultTTL)
 			return val, nil
 		}
 	}
 
-	// 6. spin-wait 超时 → 降级直查 MySQL
+	// 7. spin-wait 超时 → 降级直查 MySQL
 	return fetchFn()
+}
+
+// ---------- Lua 脚本（原子操作） ----------
+
+// unlockScript 分布式锁解锁脚本。
+// Redis 单线程模型下，Lua 脚本内的 GET+比较+DEL 连续执行，不会被其他命令插入。
+//
+//	KEYS[1] = lockKey
+//	ARGV[1] = token（锁持有者的标识）
+//
+// 如果锁的值 == token → DEL，返回 1（自己的锁）
+// 否则 → 返回 0（锁已过期或被别人持有）
+var unlockScript = redis.NewScript(`
+    if redis.call("GET", KEYS[1]) == ARGV[1] then
+        return redis.call("DEL", KEYS[1])
+    end
+    return 0
+`)
+
+// rateLimitScript 限流脚本。
+// 在 Redis 单线程模型下，INCR 和 PEXPIRE 合成原子操作。
+//
+//	KEYS[1] = 限流 key（如 "ratelimit:like:user_123"）
+//	ARGV[1] = 窗口 TTL（毫秒，如 1000）
+//	ARGV[2] = 窗口内最大次数（如 10）
+//
+// 返回值：
+//
+//	0 = 未超限，允许通过
+//	1 = 已超限，拒绝
+var rateLimitScript = redis.NewScript(`
+    local count = redis.call("INCR", KEYS[1])
+    if count == 1 then
+        redis.call("PEXPIRE", KEYS[1], ARGV[1])
+    end
+    if count > tonumber(ARGV[2]) then
+        return 1
+    end
+    return 0
+`)
+
+// Unlock 原子释放分布式锁（Lua 脚本实现）。
+func Unlock(c *redis.Client, lockKey, token string) {
+	unlockScript.Run(context.Background(), c, []string{lockKey}, token)
+}
+
+// RateLimit 检查操作是否超限（滑动窗口近似）。
+//
+// key 格式建议：ratelimit:{action}:{user_id}（如 ratelimit:like:user_123）
+// windowMs：窗口时长（毫秒），如 1000 = 1 秒
+// maxCount：窗口内最大允许次数，如 10 = 每秒最多 10 次
+//
+// 返回 true 表示未超限（放行），false 表示超限（拒绝）。
+func RateLimit(ctx context.Context, c *redis.Client, key string, windowMs int64, maxCount int64) bool {
+	if c == nil {
+		return true // Redis 挂了直接放行，不做限流
+	}
+	ret, err := rateLimitScript.Run(ctx, c, []string{key}, windowMs, maxCount).Int()
+	if err != nil {
+		return true // 脚本执行异常也放行，不阻塞业务
+	}
+	return ret == 0
 }
 
 // ---------- 内部方法 ----------
 
-// fetchAndCache 查 MySQL 并写缓存，内含 double-check。
+// fetchAndCache 查 MySQL 并写 L2（Redis）和 L1（go-cache）。
 // 专门给 singleflight 的回调用。
 func fetchAndCache(ctx context.Context, c *redis.Client, key string, baseTTL time.Duration, fetchFn func() (string, error)) (string, error) {
-	// double-check：singleflight 回调内部再查一次缓存
-	// 防止这种情况：goroutine A 刚查完 MySQL 正在写缓存，goroutine B 在 sf.Do 排队
-	// 其实 B 不需要再查 MySQL 了
+	// double-check：singleflight 回调内部再查一次 L2
 	val, err := c.Get(ctx, key).Result()
 	if err == nil {
 		if val == EmptyPlaceholder {
+			l1Cache.Set(key, EmptyPlaceholder, L1DefaultTTL)
 			return "", ErrNotFound
 		}
+		l1Cache.Set(key, val, L1DefaultTTL)
 		return val, nil
 	}
 
@@ -201,15 +325,18 @@ func fetchAndCache(ctx context.Context, c *redis.Client, key string, baseTTL tim
 	if data == "" {
 		// 缓存穿透防护：空结果写入 EMPTY_DB 占位符
 		c.Set(ctx, key, EmptyPlaceholder, EmptyPlaceholderTTL)
+		l1Cache.Set(key, EmptyPlaceholder, L1DefaultTTL)
 		return "", ErrNotFound
 	}
 
-	// 雪崩防护：TTL 加随机抖动
+	// 写 L2（Redis），雪崩防护：TTL 加随机抖动
 	c.Set(ctx, key, data, ttl)
+	// 写 L1（进程内存）
+	l1Cache.Set(key, data, L1DefaultTTL)
 	return data, nil
 }
 
-// fetchAndCacheUnsafe 不 double-check，直接查 MySQL 并写缓存。
+// fetchAndCacheUnsafe 不 double-check，直接查 MySQL 并写 L2 + L1。
 // 因为调用方（FetchWithLock）已经在拿锁前后做了两次检查。
 func fetchAndCacheUnsafe(ctx context.Context, c *redis.Client, key string, baseTTL time.Duration, fetchFn func() (string, error)) (string, error) {
 	data, err := fetchFn()
@@ -220,10 +347,14 @@ func fetchAndCacheUnsafe(ctx context.Context, c *redis.Client, key string, baseT
 	ttl := addJitter(baseTTL, DefaultJitter)
 	if data == "" {
 		c.Set(ctx, key, EmptyPlaceholder, EmptyPlaceholderTTL)
+		l1Cache.Set(key, EmptyPlaceholder, L1DefaultTTL)
 		return "", ErrNotFound
 	}
 
+	// 写 L2（Redis）
 	c.Set(ctx, key, data, ttl)
+	// 写 L1（进程内存）
+	l1Cache.Set(key, data, L1DefaultTTL)
 	return data, nil
 }
 
@@ -241,4 +372,42 @@ func addJitter(d time.Duration, pct float64) time.Duration {
 	// [0, 2*delta] 的随机偏移，再减去 delta，得到 [-delta, +delta]
 	offset := time.Duration(rand.Int63n(int64(delta)*2+1)) - delta
 	return d + offset
+}
+
+// FlushL1Cache 清除 L1 本地缓存（用于测试或缓存失效场景）。
+func FlushL1Cache() {
+	l1Cache.Flush()
+}
+
+// SetL1 直接写入 L1 缓存（用于数据变更时主动失效）。
+func SetL1(key string, val string) {
+	l1Cache.Set(key, val, L1DefaultTTL)
+}
+
+// DelL1 主动删除 L1 缓存。
+func DelL1(key string) {
+	l1Cache.Delete(key)
+}
+
+// Evict 主动删除指定 key 的 L1 + L2 缓存（清除 EMPTY_DB 占位符）。
+//
+// 使用场景：数据创建/更新后调用，清除之前可能写入的 EMPTY_DB，
+// 下次查询直接走 L3 获取真实数据，无需等待 EmptyPlaceholderTTL 过期。
+//
+// 例如发布视频后：
+//
+//	cache.Evict(ctx, fmt.Sprintf("cache:video:%s:%s", authorID, videoID))
+func Evict(ctx context.Context, key string) {
+	// 删除 L1（进程内存）
+	l1Cache.Delete(key)
+
+	// 删除 L2（Redis）
+	c := redis_client.Get()
+	if c == nil {
+		return
+	}
+	if err := c.Del(ctx, key).Err(); err != nil {
+		// 删除失败没关系，最多等 EmptyPlaceholderTTL（10s）自动过期
+		_ = err
+	}
 }

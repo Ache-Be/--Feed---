@@ -10,6 +10,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"videofeed/cache"
 	"videofeed/mq_client"
 	"videofeed/mysql_client"
 	"videofeed/redis_client"
@@ -91,6 +92,9 @@ func Publish(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Code: 2, Msg: "mysql insert video failed"})
 		return
 	}
+
+	// 清除之前可能存在的 EMPTY_DB 占位符，下次查询直接走 L3 获取真实数据
+	cache.Evict(r.Context(), fmt.Sprintf("cache:video:%s:%s", req.UserID, req.VideoID))
 
 	if c != nil {
 		if err := c.ZAdd(r.Context(), key, redis.Z{
